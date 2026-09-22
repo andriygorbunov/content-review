@@ -3,7 +3,7 @@ import argparse
 import sys
 from datetime import datetime, timezone
 
-from . import db, fetch, freeze, evals, hillclimb, labelers
+from . import db, fetch, freeze, evals, hillclimb, labelers, agreement
 
 
 # ---------------------------------------------------------------- Phase 1
@@ -152,6 +152,70 @@ def cmd_demo_drift(a, conn):
 
 
 
+# ---------------------------------------------------------------- agreement
+def _labels_by_id(conn, snapshot, labeler_name, golden_path):
+    """source_id -> label, for one 'rater'. 'golden' is a rater like any other."""
+    gold = evals.load_golden(golden_path)
+    sid = freeze.get_id(conn, snapshot)
+    if sid is None:
+        raise SystemExit(f"no snapshot named {snapshot!r}")
+    rows = [r for r in freeze.items(conn, sid) if str(r["source_id"]) in gold]
+
+    if labeler_name == "golden":
+        out = {str(r["source_id"]): gold[str(r["source_id"])]["label"] for r in rows}
+    else:
+        lab = labelers.get(labeler_name)
+        out = {}
+        for r in rows:
+            pred, _reason, _conf = lab.label(r["text"])
+            out[str(r["source_id"])] = pred
+    slices = {str(r["source_id"]): gold[str(r["source_id"])].get("slice", "clear")
+              for r in rows}
+    return out, slices
+
+
+def cmd_agreement(a, conn):
+    """Is the scorer tracking the human, or tracking the base rate?"""
+    raters = [r.strip() for r in a.raters.split(",") if r.strip()]
+    if len(raters) < 2:
+        raise SystemExit("need at least two raters, e.g. --raters keyword,golden")
+
+    labelsets, slices = {}, {}
+    for name in raters:
+        labelsets[name], slices = _labels_by_id(conn, a.snapshot, name, a.golden)
+
+    ids = sorted(set.intersection(*(set(v) for v in labelsets.values())))
+    if not ids:
+        raise SystemExit("no overlapping labeled items")
+
+    passed = True
+    if len(raters) == 2:
+        x, y = raters
+        seq_a = [labelsets[x][i] for i in ids]
+        seq_b = [labelsets[y][i] for i in ids]
+        stats = agreement.cohens_kappa(seq_a, seq_b)
+
+        by_slice = None
+        if a.by_slice:
+            by_slice = {}
+            for s in sorted({slices[i] for i in ids}):
+                sub = [i for i in ids if slices[i] == s]
+                by_slice[s] = agreement.cohens_kappa(
+                    [labelsets[x][i] for i in sub], [labelsets[y][i] for i in sub])
+        passed = agreement.report_cohen(x, y, stats, by_slice, a.min_kappa)
+    else:
+        from collections import Counter
+        ratings = [Counter(labelsets[n][i] for n in raters) for i in ids]
+        stats = agreement.fleiss_kappa(ratings)
+        agreement.report_fleiss(raters, stats)
+        if a.min_kappa is not None:
+            k = stats[0]
+            passed = k is not None and k >= a.min_kappa
+            print(f"\n  gate: kappa >= {a.min_kappa} -> {'PASS' if passed else 'FAIL'}")
+
+    sys.exit(0 if passed else 1)          # non-zero => CI gate fails
+
+
 # ---------------------------------------------------------------- hill climbing
 def cmd_errors(a, conn):
     """What to fix next. Buckets misses so you attack the biggest one."""
@@ -253,6 +317,19 @@ def main():
     ev.add_argument("--no-slice-regression", action="store_true",
                     help="CI gate: fail if ANY slice's precision dropped vs the last run")
     ev.set_defaults(fn=cmd_eval)
+
+    ag = sub.add_parser("agreement",
+                        help="inter-rater agreement (Cohen's/Fleiss' kappa) — is the "
+                             "scorer tracking the human or the base rate?")
+    ag.add_argument("--snapshot", default="base")
+    ag.add_argument("--raters", default="keyword,golden",
+                    help="comma-separated. 'golden' is a rater. 2 -> Cohen's, 3+ -> Fleiss'")
+    ag.add_argument("--golden", default="data/golden.jsonl")
+    ag.add_argument("--by-slice", action="store_true",
+                    help="per-slice kappa — where the paradox shows up")
+    ag.add_argument("--min-kappa", type=float, default=None,
+                    help="CI gate: exit non-zero below this")
+    ag.set_defaults(fn=cmd_agreement)
 
     er = sub.add_parser("errors", help="bucket misses by direction + reason (what to fix next)")
     er.add_argument("--snapshot", required=True)

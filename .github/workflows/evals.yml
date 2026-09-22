@@ -28,6 +28,29 @@ jobs:
           export CR_DB=/tmp/review.db
           python -m src.cli eval --snapshot ci --labeler keyword-v2 --min-precision 0.65
 
+      # Precision says how often a flag was right. It does NOT say whether the
+      # labeler is tracking the human or just tracking the base rate. On a
+      # skewed slice, answering "ok" every time scores well on raw agreement
+      # and carries no signal. Kappa corrects for chance; gate on it too.
+      - name: Agreement gate (kappa vs golden)
+        run: |
+          export CR_DB=/tmp/review.db
+          python -m src.cli agreement --snapshot ci --raters keyword-v2,golden \
+            --by-slice --min-kappa 0.40
+
+      # Ungated: shows v1's kappa next to v2's so the CI log carries the climb,
+      # and surfaces the high-agreement/low-kappa paradox on the baseline.
+      - name: Baseline agreement (v1, ungated)
+        run: |
+          export CR_DB=/tmp/review.db
+          python -m src.cli agreement --snapshot ci --raters keyword,golden --by-slice || true
+
+      # Three raters at once. Fleiss' kappa over v1, v2 and golden together.
+      - name: Multi-rater agreement (Fleiss)
+        run: |
+          export CR_DB=/tmp/review.db
+          python -m src.cli agreement --snapshot ci --raters keyword,keyword-v2,golden || true
+
       - name: Show the improvement
         run: |
           export CR_DB=/tmp/review.db

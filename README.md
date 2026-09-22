@@ -37,7 +37,7 @@ python3 -m src.cli init
 python3 seed_demo.py                       # offline fake thread, or:
 python3 -m src.cli fetch --story-id 42371420 # real public thread (post+comments+replies)
 
-python -m src.cli freeze --name base       # snapshot -> evals become reproducible
+python3 -m src.cli freeze --name base       # snapshot -> evals become reproducible
 
 # --- Phase 1: human-initiated, human-completed review ---
 python3 -m src.cli review-open  --snapshot base          # HUMAN starts; agent assembles
@@ -56,6 +56,11 @@ python3 -m src.cli eval    --snapshot base --labeler keyword-v2 # make a targete
 python3 -m src.cli compare --snapshot base                      # did it actually move?
 python3 -m src.cli sweep   --snapshot base --labeler keyword-v2 # pick operating points
 python3 -m src.cli history --snapshot base                      # the whole climb
+
+# --- Phase 4: is the scorer tracking the human, or the base rate? ---
+python3 -m src.cli agreement --snapshot base --raters keyword,golden --by-slice
+python3 -m src.cli agreement --snapshot base --raters keyword-v2,golden --by-slice
+python3 -m src.cli agreement --snapshot base --raters keyword,keyword-v2,golden  # Fleiss
 ```
 
 `eval` exits non-zero when it fails the gate, so it drops straight into CI.
@@ -74,8 +79,56 @@ labelers.py  text           -> (label, reason, confidence)
              KeywordLabeler = offline baseline;  LLMLabeler = the agent
 evals.py     frozen + golden -> precision/recall/F1, per-slice, CI gate
 hillclimb.py errors / sweep / compare -- the loop that turns a score into a gain
+agreement.py Cohen's / Fleiss' kappa -- is the scorer tracking the human, or
+             just the base rate? Chance-corrected agreement, per slice.
 cli.py       review workflow: human opens -> agent assembles -> human labels/closes
 ```
+
+### Validating the scorer: chance-corrected agreement
+
+Precision tells you how often a flag was right. It does **not** tell you whether
+the labeler is tracking the human or tracking the base rate. On a slice where
+95% of items are `ok`, answering `ok` every time scores 95% raw agreement and
+carries no signal at all.
+
+`agreement` corrects for the agreement you'd expect from the marginals alone:
+**Cohen's kappa** for two raters, **Fleiss' kappa** for three or more. `golden`
+is treated as a rater like any other, so you can score labeler-vs-human or
+labeler-vs-labeler with the same command.
+
+Straight out of the demo seed:
+
+```
+keyword    vs golden   kappa 0.2025   observed 0.6111   <- paradox: 61% agreement, no signal
+keyword-v2 vs golden   kappa 0.5610   observed 0.7778
+
+  by slice (v1)                        by slice (v2)
+    clear        kappa  1.0000           clear        kappa 1.0000
+    ambiguous    kappa  n/a              ambiguous    kappa 0.0000
+    adversarial  kappa -0.9600           adversarial  kappa 0.4167
+```
+
+Three things worth reading off that table:
+
+- **The headline paradox.** v1 agrees with the human 61% of the time and has a
+  kappa of 0.20. Raw agreement is inflated by skewed marginals. Quote kappa, or
+  quote both — never raw agreement alone.
+- **`ambiguous` kappa is `n/a`, not `0.0`.** Every golden label on that slice is
+  `ok` and v1 said `ok` throughout, so expected agreement is 1.0 and the
+  denominator vanishes. Same principle as precision being `n/a` on a slice with
+  no predicted positives: an inapplicable ratio reported as a number is a bug
+  that survives review because it still looks like a number.
+- **`adversarial` at -0.96 is worse than chance.** A coin flip would have done
+  better. That is the slice a safety system is actually judged on, and the
+  headline F1 hides it completely.
+
+**Landis & Koch bands** (`poor / slight / fair / moderate / substantial /
+almost perfect`) are printed for readability. They are 1977 convention, weakly
+justified — quote the number, not the adjective.
+
+**Further reading:** Cohen (1960) · Fleiss (1971) · Landis & Koch (1977) ·
+Feinstein & Cicchetti (1990), *"High agreement but low kappa"* — the paradox,
+named. Cross-check any number against `sklearn.metrics.cohen_kappa_score`.
 
 ### The improvement loop
 
