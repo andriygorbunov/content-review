@@ -1,5 +1,7 @@
 # content-review
 
+[![evals](https://github.com/andriygorbunov/content-review/actions/workflows/evals.yml/badge.svg)](https://github.com/andriygorbunov/content-review/actions)
+
 A content review system with an agentic labeler and a **drift-proof eval harness**.
 
 Stdlib-only (SQLite + urllib). No API key needed to run everything except the LLM
