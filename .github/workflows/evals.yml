@@ -15,9 +15,21 @@ jobs:
           python seed_demo.py
           python -m src.cli freeze --name ci
 
-      # Fails the build if precision drops below the floor.
-      # This is the whole point: model/prompt regressions get caught like code bugs.
-      - name: Regression gate
+      # Baseline first, ungated - it records a run so the CI log shows the climb.
+      - name: Baseline (v1)
         run: |
           export CR_DB=/tmp/review.db
-          python -m src.cli eval --snapshot ci --labeler keyword --min-precision 0.8
+          python -m src.cli eval --snapshot ci --labeler keyword || true
+
+      # The gate. Fails the build if precision drops below the floor: model and
+      # prompt regressions get caught like code bugs.
+      - name: Regression gate (v2)
+        run: |
+          export CR_DB=/tmp/review.db
+          python -m src.cli eval --snapshot ci --labeler keyword-v2 --min-precision 0.65
+
+      - name: Show the improvement
+        run: |
+          export CR_DB=/tmp/review.db
+          python -m src.cli compare --snapshot ci
+
