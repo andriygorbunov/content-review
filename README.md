@@ -33,6 +33,7 @@ python3 -m src.cli demo-drift --snapshot base
 ## Quickstart
 
 ```bash
+export CR_DB=/tmp/ci_check.db && rm -f $CR_DB  # resets DB
 python3 -m src.cli init
 python3 seed_demo.py                       # offline fake thread, or:
 python3 -m src.cli fetch --story-id 42371420 # real public thread (post+comments+replies)

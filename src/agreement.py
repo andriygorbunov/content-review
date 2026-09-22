@@ -28,6 +28,22 @@ THE PARADOX YOU WILL SEE IN YOUR OWN DATA — this is the point of the module
 
   Report kappa and observed agreement TOGETHER. Either one alone misleads.
 
+FLEISS IS NOT COHEN GENERALISED — this looks like a bug and isn't
+  The natural assumption is that Fleiss' kappa collapses back to Cohen's when
+  you give it two raters. It does not. Fleiss reduces to **Scott's pi**, which
+  computes expected agreement from the two raters' POOLED marginal
+  distribution; Cohen multiplies each rater's OWN marginals. Those are
+  different quantities whenever the raters use the categories at even slightly
+  different rates, so the same two-rater data yields two different numbers:
+
+      Cohen's  kappa=0.2500  expected=0.5000   (per-rater marginals, multiplied)
+      Fleiss'  kappa=0.2381  expected=0.5078   (pooled marginals = Scott's pi)
+      observed agreement identical in both: 0.6250
+
+  Neither is wrong. They encode different assumptions about what "chance"
+  means — Cohen lets each rater have their own bias, Scott's assumes both draw
+  from one shared distribution. Pick one per report and say which.
+
 INTERPRETATION
   The Landis & Koch (1977) bands below are convention, not statistics. They are
   widely quoted and weakly justified; a kappa of 0.62 is "substantial" only
