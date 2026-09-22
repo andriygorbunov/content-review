@@ -1,0 +1,23 @@
+name: evals
+on: [push, pull_request]
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Seed + freeze
+        run: |
+          export CR_DB=/tmp/review.db
+          python seed_demo.py
+          python -m src.cli freeze --name ci
+
+      # Fails the build if precision drops below the floor.
+      # This is the whole point: model/prompt regressions get caught like code bugs.
+      - name: Regression gate
+        run: |
+          export CR_DB=/tmp/review.db
+          python -m src.cli eval --snapshot ci --labeler keyword --min-precision 0.8

@@ -1,0 +1,3 @@
+# Phase 1 + evals: stdlib only, nothing to install.
+# Phase 2 agentic labeler only:
+# anthropic>=0.40
