@@ -3,7 +3,7 @@ import argparse
 import sys
 from datetime import datetime, timezone
 
-from . import db, fetch, freeze, evals, hillclimb, labelers, agreement
+from . import agreement, db, fetch, freeze, evals, hillclimb, labelers, agreement
 
 
 # ---------------------------------------------------------------- Phase 1
@@ -69,6 +69,11 @@ def cmd_review_label(a, conn):
                                labeled_by, created_at) VALUES (?,?,?,?,?,?,?)""",
         (a.id, a.item, a.label, a.reason or "", 1.0, f"human:{a.by}",
          datetime.now(timezone.utc).isoformat()))
+    # scope it to the review's snapshot so `agreement --raters human:<name>`
+    # compares against the same frozen text the agent saw
+    conn.execute(
+        """UPDATE labels SET snapshot_id=(SELECT snapshot_id FROM reviews WHERE id=?)
+           WHERE id=last_insert_rowid()""", (a.id,))
     conn.commit()
     print(f"labeled {a.item} -> {a.label}")
 
@@ -98,16 +103,22 @@ def cmd_agent_label(a, conn):
             """INSERT INTO labels (review_id, source_id, label, reason, confidence,
                                    labeled_by, created_at) VALUES (?,?,?,?,?,?,?)""",
             (None, it["source_id"], label, reason, conf, f"agent:{lab.name}", now))
+        conn.execute("UPDATE labels SET snapshot_id=? WHERE id=last_insert_rowid()",
+                     (sid,))
         n += 1
     conn.commit()
     print(f"agent {lab.name} labeled {n} items on snapshot {a.snapshot!r}")
+    print(f"  eval/agreement/sweep will now REPLAY these instead of re-invoking "
+          f"{lab.name}.\n  pass --fresh to force new calls.")
 
 
 def cmd_eval(a, conn):
     lab = labelers.get(a.labeler)
     m, results, passed = evals.run(conn, a.snapshot, lab, a.golden,
                                    a.min_precision, use_live=a.live,
-                                   no_slice_regression=a.no_slice_regression)
+                                   no_slice_regression=a.no_slice_regression,
+                                   allow_partial=a.allow_partial,
+                                   fresh=a.fresh)
     evals.report(m, results, passed, a.min_precision,
                  source="LIVE (drifts!)" if a.live else "FROZEN")
     sys.exit(0 if passed else 1)          # non-zero => CI gate fails
@@ -123,111 +134,65 @@ def cmd_verify(a, conn):
 
 
 def cmd_demo_drift(a, conn):
-    """The money demo: prove freezing survives live drift."""
-    lab = labelers.get("keyword")
-    print("=" * 62)
-    print("1) eval against FROZEN snapshot")
-    m1, r1, _ = evals.run(conn, a.snapshot, lab, a.golden)
-    evals.report(m1, r1, True, source="FROZEN")
+    """Proof by contrast: the frozen number holds, the live number doesn't.
 
-    print("\n2) simulating drift: editing live content...")
+    Both arms are required. "FROZEN didn't change" on its own is unfalsifiable
+    -- the number could be stable because nothing happened. The LIVE arm is the
+    control: it shows the mutation genuinely changes outcomes, so the frozen
+    stability is a property of the freezing rather than of an inert dataset.
+
+    And the pre-drift LIVE run matters too: it proves the snapshot is a faithful
+    COPY of live, not some other dataset that happens to score differently.
+    """
+    lab = labelers.get(a.labeler)
+    floor = a.min_precision
+    bar = "=" * 66
+
+    def step(n, live, note):
+        m, r, passed = evals.run(conn, a.snapshot, lab, a.golden,
+                                 min_precision=floor, use_live=live)
+        src = "LIVE  " if live else "FROZEN"
+        print(f"  {n}. {src}  precision={m['precision']}  recall={m['recall']}  "
+              f"gate>={floor} -> {'PASS' if passed else 'FAIL'}   {note}")
+        return m, passed
+
+    print(bar)
+    print(f"  Gate floor {floor} = the precision we shipped with.")
+    print(bar)
+
+    m1, _ = step(1, False, "baseline")
+    m2, _ = step(2, True,  "<- IDENTICAL: the snapshot is a faithful copy of live")
+
+    print("\n  3. introducing drift: editing live content...")
     conn.execute("""UPDATE items SET text = text || ' you idiot, click here buy now',
                     content_hash='drifted'""")
     conn.commit()
-    print("   live rows mutated.")
+    print("     live rows mutated. frozen_items untouched.\n")
 
-    print("\n3) eval against FROZEN again  -> IDENTICAL (this is the point)")
-    m2, r2, _ = evals.run(conn, a.snapshot, lab, a.golden)
-    evals.report(m2, r2, True, source="FROZEN")
+    m4, _  = step(4, False, "<- UNCHANGED. this is the point.")
+    m5, p5 = step(5, True,  "<- the gate would fail the build")
 
-    print("\n4) eval against LIVE          -> corrupted by drift")
-    m3, r3, _ = evals.run(conn, a.snapshot, lab, a.golden, use_live=True)
-    evals.report(m3, r3, True, source="LIVE (drifts!)")
-
-    print("\n" + "=" * 62)
-    same = m1["f1"] == m2["f1"]
-    print(f"frozen f1 stable: {m1['f1']} == {m2['f1']}  -> {same}")
-    print(f"live  f1 moved:   {m1['f1']} -> {m3['f1']}")
-    print("Without freezing you cannot tell a model regression from a data change.")
-
-
-
-# ---------------------------------------------------------------- agreement
-def _labels_by_id(conn, snapshot, labeler_name, golden_path):
-    """source_id -> label, for one 'rater'. 'golden' is a rater like any other."""
-    gold = evals.load_golden(golden_path)
-    sid = freeze.get_id(conn, snapshot)
-    if sid is None:
-        raise SystemExit(f"no snapshot named {snapshot!r}")
-    rows = [r for r in freeze.items(conn, sid) if str(r["source_id"]) in gold]
-
-    if labeler_name == "golden":
-        out = {str(r["source_id"]): gold[str(r["source_id"])]["label"] for r in rows}
-    else:
-        lab = labelers.get(labeler_name)
-        out = {}
-        for r in rows:
-            pred, _reason, _conf = lab.label(r["text"])
-            out[str(r["source_id"])] = pred
-    slices = {str(r["source_id"]): gold[str(r["source_id"])].get("slice", "clear")
-              for r in rows}
-    return out, slices
-
-
-def cmd_agreement(a, conn):
-    """Is the scorer tracking the human, or tracking the base rate?"""
-    raters = [r.strip() for r in a.raters.split(",") if r.strip()]
-    if len(raters) < 2:
-        raise SystemExit("need at least two raters, e.g. --raters keyword,golden")
-
-    labelsets, slices = {}, {}
-    for name in raters:
-        labelsets[name], slices = _labels_by_id(conn, a.snapshot, name, a.golden)
-
-    ids = sorted(set.intersection(*(set(v) for v in labelsets.values())))
-    if not ids:
-        raise SystemExit("no overlapping labeled items")
-
-    passed = True
-    if len(raters) == 2:
-        x, y = raters
-        seq_a = [labelsets[x][i] for i in ids]
-        seq_b = [labelsets[y][i] for i in ids]
-        stats = agreement.cohens_kappa(seq_a, seq_b)
-
-        by_slice = None
-        if a.by_slice:
-            by_slice = {}
-            for s in sorted({slices[i] for i in ids}):
-                sub = [i for i in ids if slices[i] == s]
-                by_slice[s] = agreement.cohens_kappa(
-                    [labelsets[x][i] for i in sub], [labelsets[y][i] for i in sub])
-        passed = agreement.report_cohen(x, y, stats, by_slice, a.min_kappa)
-    else:
-        from collections import Counter
-        ratings = [Counter(labelsets[n][i] for n in raters) for i in ids]
-        stats = agreement.fleiss_kappa(ratings)
-        agreement.report_fleiss(raters, stats)
-        if a.min_kappa is not None:
-            k = stats[0]
-            passed = k is not None and k >= a.min_kappa
-            print(f"\n  gate: kappa >= {a.min_kappa} -> {'PASS' if passed else 'FAIL'}")
-
-    sys.exit(0 if passed else 1)          # non-zero => CI gate fails
+    print("\n" + bar)
+    print(f"  frozen: {m1['precision']} -> {m4['precision']}   "
+          f"{'stable' if m1['precision'] == m4['precision'] else 'MOVED (bug)'}")
+    print(f"  live:   {m2['precision']} -> {m5['precision']}   moved")
+    print()
+    print(bar)
+    return 0 if m1["precision"] == m4["precision"] else 1
 
 
 # ---------------------------------------------------------------- hill climbing
 def cmd_errors(a, conn):
     """What to fix next. Buckets misses so you attack the biggest one."""
     lab = labelers.get(a.labeler)
-    _, results, _ = evals.run(conn, a.snapshot, lab, a.golden)
+    _, results, _ = evals.run(conn, a.snapshot, lab, a.golden, allow_partial=True, fresh=a.fresh)
     hillclimb.report_errors(hillclimb.taxonomy(results), show=a.show)
 
 
 def cmd_sweep(a, conn):
     """Operating points. Auto-remove and queue-for-review are not the same bar."""
     lab = labelers.get(a.labeler)
-    _, results, _ = evals.run(conn, a.snapshot, lab, a.golden)
+    _, results, _ = evals.run(conn, a.snapshot, lab, a.golden, allow_partial=True, fresh=a.fresh)
     rows, confs = hillclimb.sweep(results)
     hillclimb.report_sweep(rows, confs)
 
@@ -258,6 +223,74 @@ def cmd_compare(a, conn):
     new = by_id[a.new] if a.new else runs[0]
     old = by_id[a.old] if a.old else runs[1]
     hillclimb.report_compare(new, old, hillclimb.compare(new, old))
+
+
+
+# ---------------------------------------------------------------- agreement
+def _rater_labels(conn, snapshot, golden_path, rater, fresh=False):
+    """One rater's labels, aligned over the golden-covered frozen items.
+
+    'golden' is a rater like any other -- that is what lets you score
+    labeler-vs-human and labeler-vs-labeler with the same command.
+    """
+    sid = freeze.get_id(conn, snapshot)
+    if sid is None:
+        raise SystemExit(f"no snapshot named {snapshot!r}")
+    gold = evals.load_golden(golden_path)
+    rows = [r for r in freeze.items(conn, sid) if str(r["source_id"]) in gold]
+
+    if rater == "golden":
+        labels = [gold[str(r["source_id"])]["label"] for r in rows]
+    elif rater.startswith("human:"):
+        # A human is a rater like any other -- same table, same shape. Items
+        # nobody reviewed come back None, and cohens_kappa skips None pairs,
+        # so partial human coverage needs no special-casing.
+        seen = {str(r["source_id"]): r["label"] for r in conn.execute(
+            """SELECT source_id, label FROM labels
+               WHERE snapshot_id=? AND labeled_by=? ORDER BY id""", (sid, rater))}
+        labels = [seen.get(str(r["source_id"])) for r in rows]
+        if not seen:
+            raise SystemExit(
+                f"no labels found for rater {rater!r} on snapshot {snapshot!r}.\n"
+                f"    run review-open / review-label / review-complete first.")
+    else:
+        lab = labelers.get(rater)
+        cache = {} if fresh else evals.stored_labels(conn, sid, lab.name)
+        labels = [cache[str(r["source_id"])][0] if str(r["source_id"]) in cache
+                  else lab.label(r["text"])[0] for r in rows]
+
+    slices = [gold[str(r["source_id"])].get("slice", "clear") for r in rows]
+    return labels, slices
+
+
+def cmd_agreement(a, conn):
+    """Is the scorer tracking the human, or just the base rate?"""
+    names = [n.strip() for n in a.raters.split(",") if n.strip()]
+    if len(names) < 2:
+        raise SystemExit("need at least 2 raters, e.g. --raters keyword,golden")
+
+    series, slices = [], None
+    for n in names:
+        labels, sl = _rater_labels(conn, a.snapshot, a.golden, n, a.fresh)
+        series.append(labels)
+        slices = sl
+
+    if len(names) == 2:
+        stats = agreement.cohens_kappa(series[0], series[1])
+        by_slice = None
+        if a.by_slice:
+            by_slice = {}
+            for s in sorted(set(slices)):
+                idx = [i for i, v in enumerate(slices) if v == s]
+                by_slice[s] = agreement.cohens_kappa(
+                    [series[0][i] for i in idx], [series[1][i] for i in idx])
+        passed = agreement.report_cohen(names[0], names[1], stats,
+                                        by_slice, a.min_kappa)
+        sys.exit(0 if passed else 1)
+
+    from collections import Counter
+    ratings = [Counter(s[i] for s in series) for i in range(len(series[0]))]
+    agreement.report_fleiss(names, agreement.fleiss_kappa(ratings))
 
 
 # ---------------------------------------------------------------- wiring
@@ -314,8 +347,12 @@ def main():
                     help="CI gate: exit non-zero below this")
     ev.add_argument("--live", action="store_true",
                     help="read LIVE instead of frozen (to show why that's bad)")
+    ev.add_argument("--allow-partial", action="store_true",
+                    help="score a subset when golden labels are missing from the snapshot")
     ev.add_argument("--no-slice-regression", action="store_true",
                     help="CI gate: fail if ANY slice's precision dropped vs the last run")
+    ev.add_argument("--fresh", action="store_true",
+                    help="re-invoke the labeler instead of replaying stored agent-label output")
     ev.set_defaults(fn=cmd_eval)
 
     ag = sub.add_parser("agreement",
@@ -323,12 +360,15 @@ def main():
                              "scorer tracking the human or the base rate?")
     ag.add_argument("--snapshot", default="base")
     ag.add_argument("--raters", default="keyword,golden",
-                    help="comma-separated. 'golden' is a rater. 2 -> Cohen's, 3+ -> Fleiss'")
+                    help="comma-separated. 'golden' and 'human:<name>' are raters "
+                         "like any labeler. 2 -> Cohen's, 3+ -> Fleiss'")
     ag.add_argument("--golden", default="data/golden.jsonl")
     ag.add_argument("--by-slice", action="store_true",
                     help="per-slice kappa — where the paradox shows up")
     ag.add_argument("--min-kappa", type=float, default=None,
                     help="CI gate: exit non-zero below this")
+    ag.add_argument("--fresh", action="store_true",
+                    help="re-invoke the labeler instead of replaying stored agent-label output")
     ag.set_defaults(fn=cmd_agreement)
 
     er = sub.add_parser("errors", help="bucket misses by direction + reason (what to fix next)")
@@ -336,12 +376,16 @@ def main():
     er.add_argument("--labeler", default="keyword")
     er.add_argument("--golden", default="data/golden.jsonl")
     er.add_argument("--show", type=int, default=6)
+    er.add_argument("--fresh", action="store_true",
+                    help="re-invoke the labeler instead of replaying stored agent-label output")
     er.set_defaults(fn=cmd_errors)
 
     sw = sub.add_parser("sweep", help="precision/recall across confidence thresholds")
     sw.add_argument("--snapshot", required=True)
     sw.add_argument("--labeler", default="keyword")
     sw.add_argument("--golden", default="data/golden.jsonl")
+    sw.add_argument("--fresh", action="store_true",
+                    help="re-invoke the labeler instead of replaying stored agent-label output")
     sw.set_defaults(fn=cmd_sweep)
 
     hi = sub.add_parser("history", help="every eval run, newest first")
@@ -364,6 +408,9 @@ def main():
     dd = sub.add_parser("demo-drift", help="prove freezing survives live drift")
     dd.add_argument("--snapshot", required=True)
     dd.add_argument("--golden", default="data/golden.jsonl")
+    dd.add_argument("--labeler", default="keyword")
+    dd.add_argument("--min-precision", type=float, default=0.5,
+                    help="the floor you shipped with; live must fail it after drift")
     dd.set_defaults(fn=cmd_demo_drift)
 
     a = p.parse_args()

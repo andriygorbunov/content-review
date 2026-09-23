@@ -98,6 +98,14 @@ def _migrate(conn):
     if "version" not in cols:
         conn.execute("ALTER TABLE eval_runs ADD COLUMN version TEXT")
 
+    # `snapshot_id` scopes a stored label to the snapshot it was produced from.
+    # Without it a cached label could be replayed against different frozen text
+    # carrying the same source_id -- the exact class of bug freezing exists to
+    # prevent, reintroduced by the cache.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(labels)")}
+    if "snapshot_id" not in cols:
+        conn.execute("ALTER TABLE labels ADD COLUMN snapshot_id INTEGER")
+
 
 def labeler_version(labeler, policy_path="policy.md"):
     """Hash what actually determines the labeler's behaviour."""

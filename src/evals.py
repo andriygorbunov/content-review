@@ -22,6 +22,26 @@ def load_golden(path="data/golden.jsonl"):
     return gold
 
 
+def stored_labels(conn, snapshot_id, labeler_name):
+    """Labels persisted by `agent-label` for this snapshot + labeler.
+
+    A pure function like KeywordLabeler can be re-invoked for free. An LLM
+    cannot: it costs money, takes time, and -- the part that matters here --
+    gives a slightly different answer each call. The snapshot pins the inputs;
+    without this, nothing pins the outputs, and the demo's own numbers move
+    between commands. Freezing the data and leaving the model unfrozen solves
+    half the problem.
+
+    Latest row per source_id wins.
+    """
+    rows = conn.execute(
+        """SELECT source_id, label, reason, confidence FROM labels
+           WHERE snapshot_id=? AND labeled_by=? ORDER BY id""",
+        (snapshot_id, f"agent:{labeler_name}")).fetchall()
+    return {str(r["source_id"]): (r["label"], r["reason"], r["confidence"])
+            for r in rows}
+
+
 def _metrics(results):
     """Binary, positive class = 'violating'."""
     tp = sum(1 for r in results if r["gold"] == "violating" and r["pred"] == "violating")
@@ -46,7 +66,8 @@ def _metrics(results):
 
 
 def run(conn, snapshot_name, labeler, golden_path="data/golden.jsonl",
-        min_precision=None, use_live=False, no_slice_regression=False):
+        min_precision=None, use_live=False, no_slice_regression=False,
+        allow_partial=False, fresh=False):
     sid = freeze.get_id(conn, snapshot_name)
     if sid is None:
         raise SystemExit(f"no snapshot named {snapshot_name!r}")
@@ -54,12 +75,39 @@ def run(conn, snapshot_name, labeler, golden_path="data/golden.jsonl",
     gold = load_golden(golden_path)
     rows = freeze.live_items(conn) if use_live else freeze.items(conn, sid)
 
+    # POPULATION DRIFT GUARD.
+    # Scoring loops over the rows that happen to exist and skips golden labels
+    # with no matching row. So deleting content silently shrinks the denominator
+    # -- and in moderation the deleted content is disproportionately the
+    # VIOLATING content, which means the eval set drifts toward the easy cases
+    # and the metrics improve while nothing improved. Scoring a subset is
+    # sometimes legitimate; it has to be a decision, not a default.
+    present = {str(r["source_id"]) for r in rows}
+    missing = sorted(set(gold) - present)
+    if missing and not allow_partial:
+        raise SystemExit(
+            f"\n  GOLDEN COVERAGE FAILURE\n"
+            f"    {len(missing)} of {len(gold)} labelled items are absent from "
+            f"{'LIVE' if use_live else repr(snapshot_name)}: {missing[:8]}"
+            f"{' ...' if len(missing) > 8 else ''}\n"
+            f"    Scoring anyway would shrink the denominator silently.\n"
+            f"    Re-freeze, fix the golden set, or pass --allow-partial "
+            f"if the subset is intended.\n")
+
+    cached = {} if (fresh or use_live) else stored_labels(conn, sid, labeler.name)
+    n_cached = 0
+
     results = []
     for r in rows:
         g = gold.get(str(r["source_id"]))
         if not g:
             continue                      # only score what's labeled
-        pred, reason, conf = labeler.label(r["text"])
+        hit = cached.get(str(r["source_id"]))
+        if hit:
+            pred, reason, conf = hit
+            n_cached += 1
+        else:
+            pred, reason, conf = labeler.label(r["text"])
         results.append({
             "source_id": r["source_id"],
             "slice": g.get("slice", "clear"),
@@ -69,6 +117,9 @@ def run(conn, snapshot_name, labeler, golden_path="data/golden.jsonl",
         })
 
     m = _metrics(results)
+    m["from_stored"] = n_cached
+    m["golden_total"] = len(gold)
+    m["golden_missing"] = missing
     # per-slice: where a model is weak matters more than the headline number
     m["by_slice"] = {}
     for s in sorted({r["slice"] for r in results}):
@@ -118,6 +169,12 @@ def run(conn, snapshot_name, labeler, golden_path="data/golden.jsonl",
 def report(m, results, passed, min_precision=None, source="FROZEN"):
     print(f"\n  reading from: {source}")
     _f = lambda v: "n/a" if v is None else v
+    if m.get("from_stored"):
+        print(f"  replayed {m['from_stored']}/{m['n']} labels from `agent-label` "
+              f"(no labeler calls)")
+    if m.get("golden_missing"):
+        print(f"  ⚠ PARTIAL: scoring {m['n']} of {m['golden_total']} labelled items — "
+              f"{len(m['golden_missing'])} absent from the snapshot")
     print(f"  n={m['n']}  precision={_f(m['precision'])}  recall={_f(m['recall'])}  "
           f"f1={m['f1']}  acc={m['accuracy']}")
     print(f"  tp={m['tp']} fp={m['fp']} fn={m['fn']} tn={m['tn']}")

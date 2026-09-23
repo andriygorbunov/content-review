@@ -71,6 +71,234 @@ python3 -m src.cli agreement --snapshot base --raters keyword,keyword-v2,golden 
 
 ---
 
+## Demo Flow
+
+Two demos. **Run each in its own database** — `demo-drift` records LIVE eval runs, and
+`compare` picks the two most recent runs for the snapshot, so sharing a DB makes the
+hill-climbing comparison pick up a drifted live run instead of the v1 baseline. It produces a
+plausible-looking number that is wrong, which is the worst kind.
+
+---
+
+**Runnable scripts** — one per demo, so you are not copy-pasting live:
+
+```bash
+./demo/0_human_loop.sh      # human review + agent-vs-human kappa
+./demo/1_drift.sh           # frozen holds, live fails the gate
+./demo/2_hillclimb.sh       # errors -> fix -> compare -> kappa
+./demo/3_llm.sh             # requires LLMLabeler._call() to be filled in
+
+NOPAUSE=1 ./demo/2_hillclimb.sh   # no keypresses, for a quick sanity run
+```
+
+Each script echoes the command, waits for you to hit return, then runs it — so you can talk
+over each step. Each one also creates its own database, which is why they can be run in any
+order. The commands below are the same ones, if you would rather drive manually.
+
+### Demo 0 — the human in the loop, and whether the agent tracks them
+
+Demos 1–3 score labelers against `data/golden.jsonl`. This one scores an agent against **a
+person**, on the items that person actually reviewed.
+
+```bash
+export CR_DB=/tmp/demo_review.db && rm -f $CR_DB
+python3 -m src.cli init
+python3 seed_demo.py
+python3 -m src.cli freeze --name base
+
+python3 -m src.cli review-open  --snapshot base --by andriy     # HUMAN initiates
+python3 -m src.cli review-show  --id 1                          # agent assembled the thread
+
+python3 -m src.cli review-label --id 1 --item 3  --label violating --reason harassment
+python3 -m src.cli review-label --id 1 --item 2  --label ok --reason benign
+python3 -m src.cli review-label --id 1 --item 11 --label ok --reason "harsh, not abusive"
+python3 -m src.cli review-label --id 1 --item 12 --label ok --reason "reporting abuse is not abuse"
+python3 -m src.cli review-label --id 1 --item 15 --label violating --reason "obfuscated slur"
+python3 -m src.cli review-label --id 1 --item 18 --label violating --reason "implied threat"
+
+python3 -m src.cli review-complete --id 1                       # HUMAN closes
+
+# Phase 2: the agent labels the same snapshot, independently
+python3 -m src.cli agent-label --snapshot base --labeler keyword-v2
+
+# did the agent track the human?
+python3 -m src.cli agreement --snapshot base --raters keyword-v2,human:andriy
+python3 -m src.cli agreement --snapshot base --raters keyword,human:andriy
+```
+
+```
+review 1 opened by andriy on snapshot 'base' — agent assembled 18 items
+review 1 complete — 6 labels recorded
+
+keyword-v2 vs human:andriy   n=6  kappa=0.6667 (substantial)  observed=0.8333
+keyword    vs human:andriy   n=6  kappa=0.0000 (slight)       observed=0.5000
+```
+
+**v1 scores exactly zero against the human.** Observed agreement 50%, expected 50% — on the six
+items a person actually judged, it carried no signal at all. v2 reaches 0.6667. That is the same
+climb as Demo 2, measured against a human instead of a file.
+
+⚠️ **n=6.** A kappa on six items is indicative, not conclusive. Say that before anyone asks.
+
+**Three things to land, and they are the ones that map to the role:**
+
+1. **A human opens the review; the agent assembles.** The agent gathers the post, its comments
+   and replies into one queue item. It does not decide. That ordering *is* the product — the tool
+   removes the assembly work, not the judgement.
+2. **Humans and agents write to the same table**, distinguished only by `labeled_by`
+   (`human:andriy` vs `agent:keyword-v2`). That symmetry is why `agreement --raters
+   keyword-v2,human:andriy` needs no special-casing: **a human is a rater like any other**, which
+   is the premise the whole kappa argument rests on. Items nobody reviewed come back `None` and
+   are skipped, so partial coverage is free.
+3. **This is how the golden set stays honest at scale.** In *this* repo `golden.jsonl` was
+   hand-labelled during the build, not produced by these commands — but the loop is the same:
+   the cases the agent gets wrong are the cases worth routing to a human, and those answers
+   become new golden entries. The eval gets harder as the labeler improves rather than staying
+   a fixed bar that gets easier to clear.
+
+> If only two demos fit, run this one and Demo 2. Demo 0 shows the product and that the agent
+> tracks a person; Demo 2 shows you can prove an improvement and catch what it broke.
+
+---
+
+### Demo 1 — drift moves the live number, not the frozen one
+
+```bash
+export CR_DB=/tmp/demo_drift.db && rm -f $CR_DB
+python3 -m src.cli init
+python3 seed_demo.py
+python3 -m src.cli freeze --name base
+
+python3 -m src.cli demo-drift --snapshot base
+python3 -m src.cli verify     --snapshot base
+```
+
+Expected:
+
+```
+  Gate floor 0.5 = the precision we shipped with.
+  1. FROZEN  precision=0.5714  gate>=0.5 -> PASS   baseline
+  2. LIVE    precision=0.5714  gate>=0.5 -> PASS   <- IDENTICAL: snapshot is a faithful copy
+  3. introducing drift: editing live content...
+  4. FROZEN  precision=0.5714  gate>=0.5 -> PASS   <- UNCHANGED. this is the point.
+  5. LIVE    precision=0.4444  gate>=0.5 -> FAIL   <- the gate would fail the build
+
+  frozen items: 18   tampered: 0   drifted vs live: 18
+```
+
+The frozen number is **0.5714**, which is mediocre. That is deliberate:
+
+> Freezing does not protect the score. It protects the **attribution**. A frozen eval can fail,
+> and should. What freezing buys is that when the number moves you know it was the model,
+> because the data could not have.
+
+---
+
+### Demo 2 — the improvement loop, and whether the scorer has signal
+
+```bash
+export CR_DB=/tmp/demo_climb.db && rm -f $CR_DB
+python3 -m src.cli init
+python3 seed_demo.py
+python3 -m src.cli freeze --name base
+
+# 1. what is broken, bucketed, biggest first
+python3 -m src.cli errors --snapshot base --labeler keyword
+
+# 2. record the baseline, then the targeted fix
+python3 -m src.cli eval --snapshot base --labeler keyword
+python3 -m src.cli eval --snapshot base --labeler keyword-v2
+
+# 3. did it actually move?
+python3 -m src.cli compare --snapshot base
+
+# 4. is the scorer tracking the human, or the base rate?
+python3 -m src.cli agreement --snapshot base --raters keyword,golden    --by-slice
+python3 -m src.cli agreement --snapshot base --raters keyword-v2,golden --by-slice
+```
+
+Expected:
+
+```
+errors (v1)     3 FP  (2 spam pattern, 1 harassment) — all adversarial
+                4 FN  (all "no pattern matched")     — all adversarial
+
+compare         precision    0.5714 -> 0.70    up
+                adversarial  0.0    -> 0.75    up     fp 3 -> 1
+                ambiguous    n/a    -> 0.0             fp 0 -> 2   <- REGRESSION
+                clear        1.0    -> 1.0     =
+
+kappa           v1  0.2025 (slight)    observed 0.6111
+                v2  0.5610 (moderate)  observed 0.7778
+```
+
+**The three things to land:**
+
+1. **The fix follows from the errors.** Both v1 buckets are adversarial — quoted content causing
+   false positives, obfuscation causing false negatives. v2 strips quoted spans and normalises
+   leetspeak. Targeted at a measured bucket, not a guess.
+2. **The headline improved and the change broke something.** Adversarial went 0.0 → 0.75 while
+   `ambiguous` picked up two new false positives. That is the normal case, it is why the
+   per-slice gate exists, and `eval --no-slice-regression` exits non-zero on it.
+   The blunt version: v1 was `fp=3 fn=4`, v2 is `fp=3 fn=1`. **Total false positives did not
+   move** — v2 relocated them. The entire headline gain is recall (tp 4 → 7). So v2 does not
+   ship; the next loop starts at `errors --labeler keyword-v2`, ambiguous bucket.
+3. **Raw agreement is a liar.** v1 agrees with the human 61% of the time and has a kappa of
+   0.20 — the marginals are skewed, so most of that agreement is free. Quote kappa, or quote
+   both, never raw agreement alone.
+
+Optional, if the conversation goes there:
+
+```bash
+python3 -m src.cli sweep   --snapshot base --labeler keyword-v2   # operating points
+python3 -m src.cli history --snapshot base                        # the whole climb
+python3 -m src.cli agreement --snapshot base --raters keyword,keyword-v2,golden   # Fleiss
+```
+
+---
+
+### Demo 3 — the LLM labeler
+
+`LLMLabeler` is a network call: it costs money, takes seconds per item, and gives a
+slightly different answer each time. Run it **once** and replay.
+
+```bash
+export CR_DB=/tmp/demo_llm.db && rm -f $CR_DB
+python3 -m src.cli init
+python3 seed_demo.py
+python3 -m src.cli freeze --name base
+
+python3 -m src.cli eval --snapshot base --labeler keyword          # baseline, free
+
+# ONE pass over the model. Everything after this replays it.
+python3 -m src.cli agent-label --snapshot base --labeler llm
+
+python3 -m src.cli eval      --snapshot base --labeler llm
+python3 -m src.cli compare   --snapshot base
+python3 -m src.cli errors    --snapshot base --labeler llm
+python3 -m src.cli agreement --snapshot base --raters llm,golden --by-slice
+python3 -m src.cli sweep     --snapshot base --labeler llm
+```
+
+Without `agent-label` first, that sequence is **~90 model calls** and each block can
+disagree with the last. With it, it is 18 calls and every block reports the same numbers.
+`--fresh` on any command forces re-invocation when you actually want it.
+
+> **The point worth making out loud:** the snapshot pins the *inputs* so a rerun is
+> byte-identical. Until `agent-label` is the single pass, nothing pins the *outputs* — and
+> with a model you don't control, that is the same reproducibility problem the freezing
+> layer exists to solve, one layer up. **I froze the data and left the model unfrozen.**
+
+**What changes versus the keyword labelers:** `sweep` stops being a no-op. A regex emits one
+constant confidence, so there is exactly one operating point and the command says so. An LLM
+emits a spread, so the sweep produces a real precision/recall curve — which turns
+*"auto-remove and queue-for-review are different bars"* from a claim into a table.
+
+Re-base the CI gates afterwards. `--min-precision 0.65` and `--min-kappa 0.40` were set
+against a regex; don't assume a model clears a floor built for `keyword-v2`.
+
+---
+
 ## Architecture
 
 ```
@@ -180,6 +408,13 @@ a person noticing three weeks later.
   Zero reads as catastrophic failure; the honest answer is that the metric
   does not apply. A ratio with an empty denominator is the kind of bug that
   survives review because it still looks like a number.
+- **Golden coverage is asserted, not assumed.** Scoring loops over the rows that
+  exist and skips labels with no matching row, so deleting content silently
+  shrinks the denominator. In moderation the deleted content is
+  disproportionately the *violating* content — so the eval set drifts toward
+  easy cases and the metrics improve while nothing improved. `eval` now fails
+  when labelled items are missing from the snapshot; `--allow-partial` makes
+  scoring a subset a decision rather than a default.
 - **Every run is stamped with a version hash** of the labeler's patterns,
   prompt and `policy.md`. Without it, "I changed the prompt and precision went
   up" is a claim rather than a measurement.

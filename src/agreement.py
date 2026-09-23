@@ -151,10 +151,22 @@ def report_cohen(name_a, name_b, stats, by_slice=None, min_kappa=None):
     if k is None and obs is not None:
         print("    kappa undefined: expected agreement is 1.0 — both raters used a")
         print("    single category, so there is no variance to agree about.")
-    elif k is not None and obs is not None and obs - k > 0.30:
-        print(f"    NOTE: observed {obs:.2f} but kappa {k:.2f}. Skewed marginals are")
-        print("    inflating raw agreement — this is the 'high agreement, low kappa'")
+    elif (k is not None and obs is not None and exp is not None
+          and exp > 0.60 and obs - k > 0.30):
+        # The real paradox. It requires EXPECTED agreement to be high: when both
+        # raters overwhelmingly use one category, most of the agreement is free.
+        print(f"    NOTE: observed {obs:.2f} but kappa {k:.2f}, and expected "
+              f"agreement is {exp:.2f}.")
+        print("    Both raters lean heavily on one category, so most of that")
+        print("    agreement came for free — the 'high agreement, low kappa'")
         print("    paradox. The raw number is not the one to quote.")
+    elif k is not None and obs is not None and exp is not None and abs(k) < 0.05:
+        # Chance-level, and NOT a skew artefact. Distinguishing these two matters:
+        # the fix for skew is to quote kappa; the fix for this is a better rater.
+        print(f"    NOTE: kappa {k:.2f} — this rater is performing at CHANCE.")
+        print(f"    Observed {obs:.2f} is simply what two raters with these label")
+        print(f"    rates hit by luck (expected {exp:.2f}). Not a skew artefact:")
+        print("    there is no signal here to inflate.")
 
     if by_slice:
         print("\n  by slice:")
