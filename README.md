@@ -69,6 +69,20 @@ python3 -m src.cli agreement --snapshot base --raters keyword,keyword-v2,golden 
 > **Note:** on network/FUSE mounts SQLite can throw `disk I/O error`.
 > Set `export CR_DB=/tmp/review.db`.
 
+### Credentials
+
+Everything above runs **offline with no credentials** — the keyword baseline
+needs nothing. Only the LLM labeler (Phase 2) needs a key.
+
+```bash
+cp .env.example .env     # then fill in ANTHROPIC_API_KEY
+```
+
+`.env` is gitignored. Resolution order is process environment first, then
+`.env`, so CI can inject the key without a file. See `src/config.py` —
+`require()` fails with a fix instruction rather than a `KeyError` three frames
+down inside an HTTP client.
+
 ---
 
 ## Demo Flow
@@ -389,7 +403,7 @@ normal case, it is why the per-slice gate exists, and
 `eval --no-slice-regression` exits non-zero on it so CI catches it rather than
 a person noticing three weeks later.
 
-**Design decisions worth defending in an interview**
+**Design decisions, and why**
 
 - **Freezing copies content, not references.** A snapshot that pointed at live
   rows would drift with them. `frozen_items` stores the text and its hash.
@@ -432,16 +446,16 @@ a person noticing three weeks later.
 | 5 | `eval` with keyword baseline; read the per-slice table | baseline numbers recorded |
 | 6 | Fill in `LLMLabeler._call()`; run `agent-label` | **Phase 2 agentic labeling done** |
 | 7 | Compare LLM vs baseline; tune the gate; wire the GitHub Action | red build on regression |
-| 8 | README polish + rehearse the 2-min walkthrough | demo runs clean |
+| 8 | README polish + full end-to-end run | pipeline runs clean from `init` |
 
 **Stretch (only if hours remain):** LLM-as-judge for reasoning quality, plus
 judge/human agreement (Cohen's κ) — an unvalidated judge is just vibes.
 
 ---
 
-## The 2-minute walkthrough
+## How it works, end to end
 
-> "This is a content review system. A human opens a review, the agent assembles
+> This is a content review system. A human opens a review, the agent assembles
 > the thread — post, comments, replies — the human labels and closes it. That's
 > Phase 1. Phase 2 lets the agent label independently and adds a regression suite
 > against a golden dataset.

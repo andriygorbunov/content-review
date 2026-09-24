@@ -9,6 +9,8 @@ Two implementations on purpose:
 import os
 import re
 
+from . import config
+
 LABELS = ("violating", "ok")
 
 
@@ -76,12 +78,17 @@ class KeywordLabelerV2:
 class LLMLabeler:
     """Phase 2: the agent labels independently.
 
-    TODO (~1h): pip install anthropic, set ANTHROPIC_API_KEY, fill in _call().
+    TODO (~1h): pip install anthropic, then fill in _call().
     Keep temperature=0 and pin the model — a moving model is a moving eval.
+
+    Credentials come from config.require(), which reads the process
+    environment first and then a gitignored .env. The key is resolved lazily
+    in _call() rather than at construction, so the rest of the pipeline —
+    evals, hillclimb, agreement — runs with no credentials at all.
     """
-    def __init__(self, model="claude-sonnet-5", policy_path="policy.md"):
-        self.model = model
-        self.name = f"llm:{model}"
+    def __init__(self, model=None, policy_path="policy.md"):
+        self.model = model or config.get("CR_LLM_MODEL", "claude-sonnet-5")
+        self.name = f"llm:{self.model}"
         self.policy = (open(policy_path).read()
                        if os.path.exists(policy_path) else "")
 
@@ -99,9 +106,11 @@ REASON: <one sentence citing the policy rule>
 CONFIDENCE: <0.0-1.0>"""
 
     def _call(self, prompt):
+        # api_key = config.require("ANTHROPIC_API_KEY")   # env, then .env
+        #
         # --- fill this in ---
         # from anthropic import Anthropic
-        # msg = Anthropic().messages.create(
+        # msg = Anthropic(api_key=api_key).messages.create(
         #     model=self.model, max_tokens=200, temperature=0,
         #     messages=[{"role": "user", "content": prompt}])
         # return msg.content[0].text
